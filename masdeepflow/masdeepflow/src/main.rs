@@ -299,6 +299,10 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
 
+                    if let Ok(mut map) = sessions.lock() {
+                        // Clean up old sessions logic ...
+                    }
+
                     let direction = match direction_code {
                         0 => "CONNECT",
                         1 => "ACCEPT",
@@ -312,34 +316,95 @@ async fn main() -> anyhow::Result<()> {
                     let mut payload_clean = "";
 
                     if event.data_len > 0 {
-                        if let Ok(payload_str) = std::str::from_utf8(&event.payload) {
-                            payload_clean = payload_str.trim_matches('\0');
+                        let payload_len =
+                            std::cmp::min(event.data_len as usize, event.payload.len());
+                        let payload_bytes = &event.payload[..payload_len];
 
-                            // 1. [开始] 识别 HTTP 请求头
-                            // 如果是 GET/POST... 则认为是请求开始，记录时间
-                            if payload_clean.starts_with("GET ")
-                                || payload_clean.starts_with("POST ")
-                                || payload_clean.starts_with("PUT ")
-                                || payload_clean.starts_with("DELETE ")
-                                || payload_clean.starts_with("HEAD ")
-                            {
-                                if let Ok(mut map) = sessions.lock() {
-                                    map.insert(key, std::time::Instant::now());
-                                }
-                                if let Some(line) = payload_clean.lines().next() {
-                                    l7_info = format!("HTTP Request: {}", line);
-                                }
-                            }
-                            // 2. [结束] 识别 HTTP 响应头
-                            // 如果是 HTTP/1.1... 则认为是响应结束，计算耗时
-                            else if payload_clean.starts_with("HTTP/") {
-                                if let Ok(mut map) = sessions.lock() {
-                                    if let Some(start_time) = map.remove(&key) {
-                                        latency_ms = Some(start_time.elapsed().as_millis());
+                        // === Protocol 1: MySQL (Binary) ===
+                        if dport == 3306 || sport == 3306 {
+                            if payload_bytes.len() > 4 {
+                                let seq = payload_bytes[3];
+
+                                // Determine Direction based on Port AND Direction Code
+                                // direction_code: 2 = TX (Write), 3 = RX (Read)
+
+                                let is_request = if dport == 3306 {
+                                    // We are Client (connecting to MySQL) OR Server (receiving from Client?)
+                                    // If we are Client, TX (2) is Request. RX (3) is Response.
+                                    direction_code == 2
+                                } else {
+                                    // sport == 3306. We are Server (replying to Client) OR Client (receiving from Server?)
+                                    // If we are Server, RX (3) is Request. TX (2) is Response.
+                                    direction_code == 3
+                                };
+
+                                if is_request {
+                                    // [MySQL Request]
+                                    // Header(4) + Command(1) + SQL(...)
+                                    // COM_QUERY = 0x03
+                                    if seq == 0
+                                        && payload_bytes.len() > 5
+                                        && payload_bytes[4] == 0x03
+                                    {
+                                        if let Ok(mut map) = sessions.lock() {
+                                            map.insert(key, std::time::Instant::now());
+                                        }
+                                        let sql_slice = &payload_bytes[5..];
+                                        let sql = String::from_utf8_lossy(sql_slice);
+                                        l7_info = format!("MySQL Query: {}", sql);
+                                    }
+                                } else {
+                                    // [MySQL Response]
+                                    // OK Packet: 0x00, ERR Packet: 0xFF
+                                    let packet_type = payload_bytes[4];
+                                    if packet_type == 0x00 || packet_type == 0xFF {
+                                        if let Ok(mut map) = sessions.lock() {
+                                            if let Some(start_time) = map.remove(&key) {
+                                                latency_ms = Some(start_time.elapsed().as_millis());
+                                            }
+                                        }
+                                        if packet_type == 0x00 {
+                                            l7_info = "MySQL Response: OK".to_string();
+                                        } else {
+                                            l7_info = "MySQL Response: ERR".to_string();
+                                        }
                                     }
                                 }
-                                if let Some(line) = payload_clean.lines().next() {
-                                    l7_info = format!("HTTP Response: {}", line);
+                            }
+                        }
+
+                        // === Protocol 2: HTTP (Text) ===
+                        // Fallback logic if L7 info is still empty
+                        if l7_info.is_empty() {
+                            if let Ok(payload_str) = std::str::from_utf8(payload_bytes) {
+                                payload_clean = payload_str.trim_matches('\0');
+
+                                // 1. [开始] 识别 HTTP 请求头
+                                // 如果是 GET/POST... 则认为是请求开始，记录时间
+                                if payload_clean.starts_with("GET ")
+                                    || payload_clean.starts_with("POST ")
+                                    || payload_clean.starts_with("PUT ")
+                                    || payload_clean.starts_with("DELETE ")
+                                    || payload_clean.starts_with("HEAD ")
+                                {
+                                    if let Ok(mut map) = sessions.lock() {
+                                        map.insert(key, std::time::Instant::now());
+                                    }
+                                    if let Some(line) = payload_clean.lines().next() {
+                                        l7_info = format!("HTTP Request: {}", line);
+                                    }
+                                }
+                                // 2. [结束] 识别 HTTP 响应头
+                                // 如果是 HTTP/1.1... 则认为是响应结束，计算耗时
+                                else if payload_clean.starts_with("HTTP/") {
+                                    if let Ok(mut map) = sessions.lock() {
+                                        if let Some(start_time) = map.remove(&key) {
+                                            latency_ms = Some(start_time.elapsed().as_millis());
+                                        }
+                                    }
+                                    if let Some(line) = payload_clean.lines().next() {
+                                        l7_info = format!("HTTP Response: {}", line);
+                                    }
                                 }
                             }
                         }
