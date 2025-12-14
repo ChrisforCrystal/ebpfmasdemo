@@ -2,11 +2,26 @@
 #![no_main]
 
 use aya_ebpf::{
-    helpers::{bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid, r#gen},
-    macros::{kprobe, kretprobe, map, tracepoint},
-    maps::PerfEventArray,
-    programs::{ProbeContext, RetProbeContext, TracePointContext},
+    helpers::{
+        bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
+        bpf_msg_redirect_hash, bpf_sock_hash_update, r#gen,
+    },
+    macros::{kprobe, kretprobe, map, sk_msg, sock_ops, tracepoint},
+    maps::{PerfEventArray, SockHash},
+    programs::{ProbeContext, RetProbeContext, SkMsgContext, SockOpsContext, TracePointContext},
 };
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SockKey {
+    pub sip: u32,
+    pub dip: u32,
+    pub sport: u32,
+    pub dport: u32,
+}
+
+#[map]
+static INTERCEPT_MAP: SockHash<SockKey> = SockHash::with_max_entries(65535, 0);
 use masdeepflow_common::{ProcessEvent, TcpEvent};
 
 #[inline(always)]
@@ -685,6 +700,128 @@ pub fn masdeepflow_recvfrom_exit(ctx: TracePointContext) -> u32 {
     };
     TCP_EVENTS.output(&ctx, &event, 0);
     0
+}
+
+// =========================================================================================
+// Phase 8: High Performance Gateway (Socket Acceleration / L7 Splicing)
+// =========================================================================================
+// 原理: Socket Splicing (短路/拼接)
+// 传统路径: Box A App -> Socket -> TCP Stack -> IP -> vEth -> Bridge -> vEth -> IP -> TCP Stack -> Socket -> Box B App
+// 加速路径: Box A App -> Socket -> [eBPF Redirect] -> Socket -> Box B App
+// 收益:
+// 1. 绕过 TCP/IP 协议栈的大部分处理 (Slow Path)。
+// 2. 减少 CPU 上下文切换和内存拷贝。
+// 3. 实现 Localhost 级别的通信延迟 (Microseconds)。
+
+#[sock_ops]
+pub fn handle_sock_ops(ctx: SockOpsContext) -> u32 {
+    let ops = ctx.ops;
+    let op = unsafe { (*ops).op };
+
+    // [入口过滤]
+    // 我们只关注连接建立完成的时刻。
+    // BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB (0): 服务端收到 SYN+ACK，连接变为 ESTABLISHED。
+    // BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB (1): 客户端收到 ACK，连接变为 ESTABLISHED。
+    if op != 0 && op != 1 {
+        return 0;
+    }
+
+    // AF_INET = 2 (仅处理 IPv4)
+    let family = unsafe { (*ops).family };
+    if family != 2 {
+        return 0;
+    }
+
+    // [提取四元组]
+    // 注意: eBPF 中的 IP 是网络字节序 (Big Endian)，Port 也是。
+    // 但 (*ops).local_port 在某些内核版本/上下文中可能是 Host Endian。
+    // 这里我们假设 local_port 是 Host Endian (aya/kernel 惯例对于 sock_ops 字段)，
+    // 而 remote_port 是 Network Endian。
+    let remote_ip4 = unsafe { (*ops).remote_ip4 };
+    let local_ip4 = unsafe { (*ops).local_ip4 };
+    let local_port = unsafe { (*ops).local_port };
+    let remote_port = unsafe { (*ops).remote_port };
+
+    // [关键: 字节序归一化]
+    // 为了作为 Map 的 Key，必须保证 Key 的格式统一。
+    // 我们约定 Map Key 中的 Port 全部使用 Host Endian (大端转小端，如果在 x86 上)。
+    // local_port 已经是 Host Endian (sock_ops 特性)。
+    // remote_port 是 Network Endian，需要转换。
+    let remote_port_host = u32::from_be(remote_port);
+
+    let key = SockKey {
+        sip: local_ip4,
+        dip: remote_ip4,
+        sport: local_port,
+        dport: remote_port_host,
+    };
+
+    // [注册 Socket]
+    // 将当前 Socket (ctx) 放入 SockHash Map。
+    // 这样，当另一个 Socket (对端) 想要发送数据给这个四元组时，
+    // 就可以通过 lookup 这个 Map 找到当前 Socket 的句柄，直接 Redirect。
+    unsafe {
+        let _ = bpf_sock_hash_update(
+            ops as *mut _,
+            &INTERCEPT_MAP as *const _ as *mut _,
+            &key as *const _ as *mut _,
+            0, // BPF_ANY (覆盖更新)
+        );
+    }
+
+    0
+}
+
+#[sk_msg]
+pub fn redirect_traffic(ctx: SkMsgContext) -> u32 {
+    let msg = ctx.msg;
+
+    // AF_INET = 2
+    let family = unsafe { (*msg).family };
+    if family != 2 {
+        return 1; // SK_PASS = 1 (放行，走标准协议栈)
+    }
+
+    let remote_ip4 = unsafe { (*msg).remote_ip4 };
+    let local_ip4 = unsafe { (*msg).local_ip4 };
+    let local_port = unsafe { (*msg).local_port };
+    let remote_port = unsafe { (*msg).remote_port };
+
+    // [归一化]
+    let remote_port_host = u32::from_be(remote_port);
+
+    // [构造反向查询 Key]
+    // 场景: Socket A (Local) 发送给 Socket B (Remote)。
+    // 我们想把数据直接 Redirect 给 Socket B。
+    // Socket B 在 Map 中注册的 Key 是什么？
+    // B 注册时: SIP=B_IP, DIP=A_IP, SPort=B_Port, DPort=A_Port.
+    // 我们 (A) 持有的信息: Local=A_IP, Remote=B_IP, LocP=A_Port, RemP=B_Port.
+    // 所以，我们要查找的 Key 应该是 (Remote, Local, RemP, LocP)。
+
+    let key = SockKey {
+        sip: remote_ip4,         // 对应 B 的 SIP
+        dip: local_ip4,          // 对应 B 的 DIP
+        sport: remote_port_host, // 对应 B 的 SPort
+        dport: local_port,       // 对应 B 的 DPort
+    };
+
+    unsafe {
+        // [核心加速动作: Redirect]
+        // bpf_msg_redirect_hash: 尝试在 Map 中找到 Key 对应的 Socket。
+        // 如果找到: 将数据直接注入该 Socket 的接收队列 (Ingress Queue)。
+        // flag 1 = BPF_F_INGRESS (注入接收方向，让应用层就像读到了网络数据一样)
+        // 返回值:
+        //   SK_PASS (1): 没找到 (Redirect 失败)，回退走标准协议栈。
+        //   其他: Redirect 成功，数据被“偷”走了，内核协议栈不会再处理它。
+        let _ = bpf_msg_redirect_hash(
+            msg as *mut _,
+            &INTERCEPT_MAP as *const _ as *mut _,
+            &key as *const _ as *mut _,
+            1,
+        );
+    }
+
+    1 // SK_PASS = 1 (总是返回 Pass，如果 Redirect 成功，这个 Pass 会被 Redirect 覆盖/接管)
 }
 
 #[cfg(not(test))]

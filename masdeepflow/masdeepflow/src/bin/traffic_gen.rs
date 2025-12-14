@@ -40,6 +40,59 @@ fn main() -> std::io::Result<()> {
                 Err(e) => println!("Connection failed: {}", e),
             }
         }
+    } else if mode == "benchmark-server" {
+        use std::io::Read;
+        use std::net::TcpListener;
+        println!("Starting Benchmark Server on 0.0.0.0:8080...");
+        let listener = TcpListener::bind("0.0.0.0:8080")?;
+        for stream in listener.incoming() {
+            match stream {
+                Ok(mut stream) => {
+                    println!("Client connected. Receiving data...");
+                    let mut buf = [0u8; 65536];
+                    let mut total = 0usize;
+                    let start = std::time::Instant::now();
+                    loop {
+                        match stream.read(&mut buf) {
+                            Ok(0) => break, // EOF
+                            Ok(n) => total += n,
+                            Err(e) => {
+                                eprintln!("Read error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    let dur = start.elapsed();
+                    let info = format!(
+                        "Received {} bytes in {:?}. Speed: {:.2} MB/s",
+                        total,
+                        dur,
+                        (total as f64 / 1024.0 / 1024.0) / dur.as_secs_f64()
+                    );
+                    println!("{}", info);
+                }
+                Err(e) => eprintln!("Connection failed: {}", e),
+            }
+        }
+    } else if mode == "benchmark-client" {
+        println!("Starting Benchmark Client -> 127.0.0.1:8080 (10s test)...");
+        let mut stream = TcpStream::connect("127.0.0.1:8080")?;
+        let buf = [1u8; 65536];
+        let mut total = 0usize;
+        let start = std::time::Instant::now();
+        while start.elapsed().as_secs() < 10 {
+            use std::io::Write;
+            stream.write_all(&buf)?;
+            total += buf.len();
+        }
+        let dur = start.elapsed();
+        let info = format!(
+            "Sent {} bytes in {:?}. Speed: {:.2} MB/s",
+            total,
+            dur,
+            (total as f64 / 1024.0 / 1024.0) / dur.as_secs_f64()
+        );
+        println!("{}", info);
     } else if mode == "mysql-client" {
         println!("Mode: MySQL Client (Simulated)");
         println!("Connecting to 127.0.0.1:3306...");

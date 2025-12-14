@@ -1,7 +1,8 @@
+use anyhow::Context;
 use aya::{
-    Bpf, include_bytes_aligned,
-    maps::perf::AsyncPerfEventArray,
-    programs::{KProbe, TracePoint},
+    Ebpf as Bpf, include_bytes_aligned,
+    maps::{SockHash, perf::AsyncPerfEventArray},
+    programs::{KProbe, SkMsg, SockOps, TracePoint, links::CgroupAttachMode},
     util::online_cpus,
 };
 use aya_log::EbpfLogger;
@@ -15,6 +16,17 @@ use tokio::{signal, task};
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {}
+
+// 我们定义了与内核态完全一致的结构体 SockKey，并标记为 #[repr(C)]。这是用户态和内核态读写 Map 的“通用语言”。
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SockKey {
+    pub sip: u32,
+    pub dip: u32,
+    pub sport: u32,
+    pub dport: u32,
+}
+unsafe impl aya::Pod for SockKey {}
 
 // [Phase 2] Latency Tracking Key (5-tuple equivalent: PID+FD)
 // Since we don't have PID in TcpEvent yet, we use CGroup ID + FD which is unique enough for a Pod.
@@ -137,6 +149,32 @@ async fn main() -> anyhow::Result<()> {
         .try_into()?;
     program.load()?;
     program.attach("syscalls", "sys_exit_recvfrom")?;
+
+    // (H) Socket Acceleration (Phase 8)
+    info!("Loading Socket Acceleration programs...");
+
+    // 1. Load Map & Extract FD (Scope to release borrow)
+    let map_fd = {
+        let intercept_map: SockHash<_, SockKey> =
+            SockHash::try_from(bpf.map_mut("INTERCEPT_MAP").unwrap())?;
+        intercept_map.fd().try_clone()?
+    };
+
+    // 2. Attach SockOpts to CgroupV2 Root
+    let cgroup_path = "/sys/fs/cgroup";
+    let cgroup_file = std::fs::File::open(cgroup_path)
+        .context("Failed to open cgroup root. Ensure Cgroup V2 is mounted at /sys/fs/cgroup")?;
+
+    let program: &mut SockOps = bpf.program_mut("handle_sock_ops").unwrap().try_into()?;
+    program.load()?;
+    program.attach(cgroup_file, CgroupAttachMode::Single)?;
+
+    // 3. Attach SkMsg to Map
+    let program: &mut SkMsg = bpf.program_mut("redirect_traffic").unwrap().try_into()?;
+    program.load()?;
+    program.attach(&map_fd)?;
+
+    info!("Socket Acceleration Enabled.");
 
     info!("Probes attached. Monitoring...");
 

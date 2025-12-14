@@ -29,6 +29,7 @@ COPY . .
 # 5. 执行构建
 # 这里虽然写的是 build masdeepflow (用户态)，但里面的 build.rs 会自动触发 eBPF 的编译
 WORKDIR /usr/src/masdeepflow/masdeepflow
+# Debug Hack: Find CgroupAttachMode and SockHash::fd
 RUN cargo build --release
 
 # === 第 2 阶段：运行环境 (Runner) ===

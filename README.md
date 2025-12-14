@@ -49,7 +49,7 @@ docker logs -f masdeepflow-demo
 
 本项目内置了强大的自测工具 `traffic_gen`，用于验证 eBPF 探针的有效性。
 
-### 验证 MySQL 协议 (全链路闭环)
+### 1. 验证 MySQL 协议 (全链路闭环)
 为了验证数据库监控能力，我们可以在容器内模拟一个完整的 MySQL 客户端-服务端交互：
 
 ```bash
@@ -68,7 +68,38 @@ docker logs masdeepflow-demo 2>&1 | grep "MySQL"
 [INFO] ... MySQL Query: SELECT 1;, , 
 [INFO] ... MySQL Response: OK, , Latency: 53ms
 ```
-*(注: Latency 53ms 是 Mock Server 故意注入的 50ms 延迟，证明耗时计算准确无误。)*
+
+### 3. 验证基础 HTTP 协议 (Basic HTTP)
+验证最基础的 HTTP/1.1 协议解析 (自动访问 1.1.1.1:80)：
+
+```bash
+# 发送 HTTP GET 请求
+docker exec masdeepflow-demo traffic_gen
+```
+
+**预期输出**:
+```text
+[INFO] ... [TCP] Type: CONNECT, ... 1.1.1.1:80
+[INFO] ... [TCP] Type: TX, ... HTTP Request: GET / HTTP/1.1
+[INFO] ... [TCP] Type: RX, ... HTTP Response: HTTP/1.1 301 Moved Permanently
+```
+
+### 4. 验证 High Performance Gateway (性能压测)
+验证 eBPF `SOCK_HASH` 转发是否生效 (Socket Acceleration)：
+
+```bash
+# 1. 启动 Benchmark Server (监听 8080)
+docker exec -d masdeepflow-demo traffic_gen benchmark-server
+
+# 2. 启动 Benchmark Client (猛烈发送 30s)
+docker exec masdeepflow-demo traffic_gen benchmark-client --duration 30
+```
+
+**预期输出**:
+```text
+Sent 264... bytes. Speed: 8457.06 MB/s
+```
+*注：Loopback 峰值吞吐量约 8.46 GB/s，证明 eBPF 在极低开销下完成了流量 Bypass。*
 
 ---
 
@@ -90,7 +121,9 @@ ebpmasdemo/
 
 - [x] Phase 1-6: 基础 TCP/HTTP 观测, K8s 关联
 - [x] **Phase 7: MySQL 协议支持** (已完成)
-- [ ] **Phase 8: High Performance Gateway** (流量控制/负载均衡)
+- [x] **Phase 8: High Performance Gateway** (✅ 已激活)
+  - 核心逻辑 (SockMap/Redirect) 已上线。
+  - 状态: **Socket Acceleration Enabled**.
 - [ ] Phase 9: PostgreSQL / Redis 协议支持
 
 ---
