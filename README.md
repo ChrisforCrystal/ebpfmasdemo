@@ -49,49 +49,51 @@ docker logs -f masdeepflow-demo
 
 本项目内置了强大的自测工具 `traffic_gen`，用于验证 eBPF 探针的有效性。
 
-### 1. 验证 MySQL 协议 (全链路闭环)
-为了验证数据库监控能力，我们可以在容器内模拟一个完整的 MySQL 客户端-服务端交互：
-
-```bash
-# 1. 启动 Mock MySQL Server (监听 3306，自动回复 OK 包)
-docker exec -d masdeepflow-demo traffic_gen mysql-server
-
-# 2. 启动 Client 发送查询 (SELECT 1;)
-docker exec masdeepflow-demo traffic_gen mysql-client
-
-# 3. 检查 Agent 日志
-docker logs masdeepflow-demo 2>&1 | grep "MySQL"
-```
-
-**预期输出**:
-```text
-[INFO] ... MySQL Query: SELECT 1;, , 
-[INFO] ... MySQL Response: OK, , Latency: 53ms
-```
-
-### 3. 验证基础 HTTP 协议 (Basic HTTP)
+### 1. 验证基础 HTTP 协议 (Basic HTTP)
 验证最基础的 HTTP/1.1 协议解析 (自动访问 1.1.1.1:80)：
 
 ```bash
-# 发送 HTTP GET 请求
 docker exec masdeepflow-demo traffic_gen
 ```
 
-**预期输出**:
-```text
-[INFO] ... [TCP] Type: CONNECT, ... 1.1.1.1:80
-[INFO] ... [TCP] Type: TX, ... HTTP Request: GET / HTTP/1.1
-[INFO] ... [TCP] Type: RX, ... HTTP Response: HTTP/1.1 301 Moved Permanently
+### 2. 验证 MySQL 协议
+模拟 MySQL 客户端-服务端交互 (Port 3306)：
+
+```bash
+docker exec -d masdeepflow-demo traffic_gen mysql-server
+docker exec masdeepflow-demo traffic_gen mysql-client
+docker logs masdeepflow-demo 2>&1 | grep "MySQL"
 ```
 
-### 4. 验证 High Performance Gateway (性能压测)
+### 3. 验证 Redis 协议 (New!)
+模拟 Redis 交互 (Port 6379, RESP 协议)：
+
+```bash
+# 启动 Mock Redis Server & Client
+docker exec -d masdeepflow-demo traffic_gen redis-server
+docker exec masdeepflow-demo traffic_gen redis-client
+# 检查日志
+docker logs masdeepflow-demo 2>&1 | grep "Redis"
+```
+**预期输出**: `Redis Command: GET`, `Redis Response: OK`
+
+### 4. 验证 PostgreSQL 协议 (New!)
+模拟 Postgres 交互 (Port 5432, Binary 协议)：
+
+```bash
+# 启动 Mock PG Server & Client
+docker exec -d masdeepflow-demo traffic_gen pg-server
+docker exec masdeepflow-demo traffic_gen pg-client
+# 检查日志
+docker logs masdeepflow-demo 2>&1 | grep "PG"
+```
+**预期输出**: `PG Query: SELECT 1`, `PG Response: CommandComplete`
+
+### 5. 验证 High Performance Gateway (性能压测)
 验证 eBPF `SOCK_HASH` 转发是否生效 (Socket Acceleration)：
 
 ```bash
-# 1. 启动 Benchmark Server (监听 8080)
 docker exec -d masdeepflow-demo traffic_gen benchmark-server
-
-# 2. 启动 Benchmark Client (猛烈发送 30s)
 docker exec masdeepflow-demo traffic_gen benchmark-client --duration 30
 ```
 
@@ -124,7 +126,10 @@ ebpmasdemo/
 - [x] **Phase 8: High Performance Gateway** (✅ 已激活)
   - 核心逻辑 (SockMap/Redirect) 已上线。
   - 状态: **Socket Acceleration Enabled**.
-- [ ] Phase 9: PostgreSQL / Redis 协议支持
+- [x] **Phase 9: PostgreSQL / Redis 协议支持** (✅ 已完成)
+  - Redis (RESP) Parser & Mock
+  - PostgreSQL (Binary) Parser & Mock
+
 
 ---
 *Built with ❤️ by masAllSome Team using Rust & eBPF.*

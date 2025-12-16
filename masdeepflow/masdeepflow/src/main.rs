@@ -410,6 +410,69 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        // === Protocol 2: Redis (RESP) ===
+                        if dport == 6379 || sport == 6379 {
+                            let is_request = if dport == 6379 {
+                                direction_code == 2
+                            } else {
+                                direction_code == 3
+                            };
+                            if is_request {
+                                // Request: Array "*"
+                                if payload_bytes.len() > 0 && payload_bytes[0] == b'*' {
+                                    if let Ok(mut map) = sessions.lock() {
+                                        map.insert(key, std::time::Instant::now());
+                                    }
+                                    // Parse RESP Array: *2\r\n$3\r\nGET\r\n...
+                                    // Simplified: Just convert to string and take first line or "Redis Command"
+                                    if let Ok(s) = std::str::from_utf8(payload_bytes) {
+                                        let cmd_line = s.lines().nth(2).unwrap_or("UNKNOWN");
+                                        l7_info = format!("Redis Command: {}", cmd_line);
+                                    }
+                                }
+                            } else {
+                                // Response: Simple String "+"
+                                if payload_bytes.len() > 0 && payload_bytes[0] == b'+' {
+                                    if let Ok(mut map) = sessions.lock() {
+                                        if let Some(start_time) = map.remove(&key) {
+                                            latency_ms = Some(start_time.elapsed().as_millis());
+                                        }
+                                    }
+                                    l7_info = "Redis Response: OK".to_string();
+                                }
+                            }
+                        }
+
+                        // === Protocol 3: PostgreSQL ===
+                        if dport == 5432 || sport == 5432 {
+                            let is_request = if dport == 5432 {
+                                direction_code == 2
+                            } else {
+                                direction_code == 3
+                            };
+                            if is_request {
+                                // Simple Query: 'Q'
+                                if payload_bytes.len() > 5 && payload_bytes[0] == b'Q' {
+                                    if let Ok(mut map) = sessions.lock() {
+                                        map.insert(key, std::time::Instant::now());
+                                    }
+                                    // Format: Q | Len(4) | SQLString | \0
+                                    let sql_slice = &payload_bytes[5..];
+                                    let sql = String::from_utf8_lossy(sql_slice);
+                                    l7_info = format!("PG Query: {}", sql.trim_matches('\0'));
+                                }
+                            } else {
+                                // CommandComplete: 'C'
+                                if payload_bytes.len() > 0 && payload_bytes[0] == b'C' {
+                                    if let Ok(mut map) = sessions.lock() {
+                                        if let Some(start_time) = map.remove(&key) {
+                                            latency_ms = Some(start_time.elapsed().as_millis());
+                                        }
+                                    }
+                                    l7_info = "PG Response: CommandComplete".to_string();
+                                }
+                            }
+                        }
 
                         // === Protocol 2: HTTP (Text) ===
                         // Fallback logic if L7 info is still empty
